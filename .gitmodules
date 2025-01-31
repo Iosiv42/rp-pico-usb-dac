@@ -1,0 +1,3 @@
+[submodule "usbd-audio"]
+	path = usbd-audio
+	url = https://github.com/Orange-Murker/usbd-audio.git
