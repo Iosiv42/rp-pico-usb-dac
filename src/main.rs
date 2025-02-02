@@ -10,7 +10,7 @@ rp2040_timer_monotonic!(Mono);
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true, dispatchers = [RTC_IRQ, DMA_IRQ_1])]
 mod app {
     use super::*;
-    use core::{mem::{transmute, transmute_copy}, task};
+    use core::{mem::{transmute, transmute_copy}, slice, task};
 
     use cortex_m::{interrupt, singleton};
     use embedded_hal::digital::{OutputPin, StatefulOutputPin};
@@ -28,10 +28,12 @@ mod app {
 
     const PACKET_SIZE: usize = 48;
     const BUFFER_SIZE: usize = 8;
+    const DA: usize = 2;
     type Packet = [u32; PACKET_SIZE];
 
     #[shared]
     struct Shared {
+        led: Pin<Gpio25, FunctionSio<SioOutput>, PullDown>,
     }
 
     #[local]
@@ -45,8 +47,7 @@ mod app {
         >>,
         usb_dev: UsbDevice<'static, UsbBus>,
         usbd_audio: AudioClass<'static, UsbBus>,
-        buf: [u8; 4*PACKET_SIZE],
-        led: Pin<Gpio25, FunctionSio<SioOutput>, PullDown>,
+        buf: [u8; 4*PACKET_SIZE*DA],
         sender: Sender<'static, Packet, BUFFER_SIZE>,
         receiver: Receiver<'static, Packet, BUFFER_SIZE>,
     }
@@ -232,90 +233,56 @@ mod app {
         };
         
         let mut dma = c.device.DMA.split(&mut resets);
-        dma.ch0.enable_irq0();
-        // dma.ch1.enable_irq0();
-
-        // let da = unsafe { transmute::<_, u32>([i16::MIN; 2]) };
-
-        let sinetab = [
-            0i16, 4276, 8480, 12539, 16383, 19947, 23169, 25995, 28377, 30272, 31650, 32486, 32767,
-            32486, 31650, 30272, 28377, 25995, 23169, 19947, 16383, 12539, 8480, 4276, 0, -4276, -8480,
-            -12539, -16383, -19947, -23169, -25995, -28377, -30272, -31650, -32486, -32767, -32486,
-            -31650, -30272, -28377, -25995, -23169, -19947, -16383, -12539, -8480, -4276,
-        ];
-        let sinetab = sinetab.map(|e| {
-            let val = (e / 64) as u16 as u32;
-            (val << 16) | val
-        });
         
-        let tx_buf0 = singleton!(BUF0: Packet = sinetab).unwrap();
-        let tx_buf1 = singleton!(BUF1: Packet = sinetab).unwrap();
+        let tx_buf0 = singleton!(BUF0: Packet = [0u32; PACKET_SIZE]).unwrap();
+        let tx_buf1 = singleton!(BUF1: Packet = [0u32; PACKET_SIZE]).unwrap();
         
-        heartbeat::spawn().ok();
-        dma_handler::spawn().ok();
+        // heartbeat::spawn().ok();
 
         let (mut s, r) = make_channel!(Packet, BUFFER_SIZE);
-
-        // c.local.led.toggle().unwrap();
-        let mut buf = [0u8; PACKET_SIZE*4];
-        loop {
-            if usb_dev.poll(&mut [&mut usbd_audio]) {
-                usbd_audio.read(&mut buf);
-                if s.try_send(unsafe { transmute(buf) }).is_err() {
-                    break;
-                }
-            }
-        }
-
-        // c.device.USBCTRL_REGS.inte()
-            
+        let mut buf = [0u8; PACKET_SIZE*4*DA];
         let tx_transfer = double_buffer::Config::new((dma.ch0, dma.ch1), tx_buf0, i2s_tx).start();
-        // let tx_transfer = single_buffer::Config::new(dma.ch0, sinetab_buf0, i2s_tx).start();
         let tx_transfer = tx_transfer.read_next(tx_buf1);
+        dma_handler::spawn().ok();
 
         (
-            Shared { },
+            Shared { led },
             Local {
                 tx_transfer: Some(tx_transfer),
                 usb_dev,
                 usbd_audio,
                 buf,
-                led,
+                // led,
                 sender: s,
                 receiver: r,
             },
         )
     }
 
-    #[task(priority = 1, local = [led])]
-    async fn heartbeat(c: heartbeat::Context) {
-        let led = c.local.led;
-        loop {
-            led.toggle().unwrap();
-            Mono::delay(500.millis()).await;
-        }
-    }
-
     #[task(
         binds = USBCTRL_IRQ,
         priority = 4,
-        local = [usb_dev, usbd_audio, sender, buf]
+        local = [usb_dev, usbd_audio, sender, buf],
+        shared = [led],
     )]
-    fn usb_handler(c: usb_handler::Context) {
-        // let usb_dev = c.local.usb_dev;
-        // let usbd_audio = c.local.usbd_audio;
-        // let sender = c.local.sender;
-        // let led = c.local.led;
-
+    fn usb_handler(mut c: usb_handler::Context) {
         if c.local.usb_dev.poll(&mut [c.local.usbd_audio]) {
-            c.local.usbd_audio.read(c.local.buf);
-            c.local.sender.try_send(unsafe { transmute_copy(c.local.buf) });
+            if let Ok(len) = c.local.usbd_audio.read(c.local.buf) {
+                let slice = unsafe { slice::from_raw_parts(
+                    c.local.buf.as_ptr().cast::<Packet>(),
+                    len.div_ceil(PACKET_SIZE)
+                ) };
+                for packet in slice.into_iter() {
+                    // let state = c.local.sender.try_send(*packet).is_err();
+                    let _ = c.local.sender.try_send(*packet);
+                    // c.shared.led.lock(|led| led.set_state(hal::gpio::PinState::from(state)).ok());
+                }
+            }
         }
-        // led.toggle().unwrap();
     }
 
-    #[task(priority = 3, local = [tx_transfer, receiver])]
-    async fn dma_handler(c: dma_handler::Context) {
+    #[task(priority = 3, local = [tx_transfer, receiver], shared = [led])]
+    async fn dma_handler(mut c: dma_handler::Context) {
         let mut tx_transfer = c.local.tx_transfer.take().unwrap();
         let r = c.local.receiver;
 
@@ -326,18 +293,17 @@ mod app {
                 *tx_buf = packet;
             }
 
+            // c.shared.led.lock(|led| 
+            //     led.set_state(hal::gpio::PinState::from(next_tx_transfer.is_done()))
+            // );
+
+            // // if next_tx_transfer.is_done() {
+            // //     c.shared.led.lock(|led| led.set_high().ok());
+            // // } else {
+            // //     c.shared.led.lock(|led| led.set_low().ok());
+            // // }
+
             tx_transfer = next_tx_transfer.read_next(tx_buf);
         }
     }
-
-    //     next_tx_transfer.check_irq0();
-    //     c.local.tx_transfer.replace(next_tx_transfer.read_next(tx_buf));
-
-
-    //     // let (mut ch, tx_buf, i2s_tx) = c.local.tx_transfer.take().unwrap().wait();
-        
-    //     // // tx_buf.map(|sample| !sample);
-
-    //     // c.local.tx_transfer.replace(single_buffer::Config::new(ch, tx_buf, i2s_tx).start());
-    // }
 }

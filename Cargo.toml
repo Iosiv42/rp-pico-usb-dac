@@ -16,9 +16,10 @@ rtic = { version = "2.1.2", features = [ "thumbv6-backend" ] }
 rtic-monotonics = { version = "2.0.3", features = [ "rp2040" ] }
 rtic-sync = "1.3.0"
 usb-device = { version = "0.3.2", features = [ "control-buffer-256" ] }
-usbd-audio = { path = "./usbd-audio" }
+# usbd-audio = { path = "./usbd-audio" }
 portable-atomic = { version = "1", features = ["critical-section"] }
 panic-probe = "0.3.2"
+usbd-audio = "0.2.0"
 
 [profile.dev]
 opt-level = 1
