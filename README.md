@@ -1,1 +1,5 @@
-Consisting of periodical packets loss with length of approximately half a second
+# USB DAC based on RP2040 (consist sound artifacts)
+
+## Assembly
+
+![](assets/assembly.jpg "")
