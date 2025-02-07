@@ -8,28 +8,34 @@ use rtic_monotonics::rp2040::prelude::*;
 rp2040_timer_monotonic!(Mono);
 
 mod setup_clocks;
-mod setup_i2s;
+mod i2s;
 mod setup_usb;
+
+extern crate alloc;
 
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true, dispatchers = [RTC_IRQ, DMA_IRQ_1])]
 mod app {
-    use crate::{setup_clocks::setup_clocks, setup_i2s::setup_i2s, setup_usb::setup_usb};
+    use crate::{setup_clocks::setup_clocks, i2s::setup_i2s, setup_usb::setup_usb};
 
     use super::*;
-    use core::slice;
+    use core::{mem::transmute_copy, slice};
 
+    use alloc::{boxed::Box, collections::vec_deque::VecDeque, vec::Vec};
     use cortex_m::singleton;
-    use embedded_hal::digital::StatefulOutputPin;
+    use embedded_hal::digital::{OutputPin, StatefulOutputPin};
     use rp_pico::{
-        hal::{self, dma::{double_buffer::{self, Transfer, ReadNext}, Channel, DMAExt, CH0, CH1}, gpio::{bank0::Gpio25, FunctionSio, Pin, PullDown, SioOutput}, usb::UsbBus, watchdog::Watchdog, Sio}, pac::PIO0
+        hal::{self, dma::{double_buffer::{self, ReadNext, Transfer}, Channel, DMAExt, CH0, CH1}, gpio::{bank0::Gpio25, FunctionSio, Pin, PullDown, SioOutput}, pio::{Tx, SM0}, usb::UsbBus, watchdog::Watchdog, Sio}, pac::PIO0
     };
-    use hal::pio::{Tx, SM0};
     use rtic_sync::{channel::{Receiver, Sender}, make_channel};
     use usb_device::{bus::UsbBusAllocator, device::UsbDevice};
     use usbd_audio::AudioClass;
 
-    const PACKET_SIZE: usize = 48;
-    const BUFFER_SIZE: usize = 8;
+    use embedded_alloc::LlffHeap as Heap;
+    #[global_allocator]
+    static HEAP: Heap = Heap::empty();
+
+    const PACKET_SIZE: usize = 256/4;
+    const BUFFER_SIZE: usize = 4;
     type Packet = [u32; PACKET_SIZE];
 
     #[shared]
@@ -46,15 +52,22 @@ mod app {
             Tx<(PIO0, SM0)>,
             ReadNext<&'static mut Packet>
         >>,
+        // i2s_tx: Tx<(PIO0, SM0)>,
         usb_dev: UsbDevice<'static, UsbBus>,
         usbd_audio: AudioClass<'static, UsbBus>,
-        usb_audio_buf: [u8; 1024],
-        sender: Sender<'static, Packet, BUFFER_SIZE>,
-        receiver: Receiver<'static, Packet, BUFFER_SIZE>,
+        sender: Sender<'static, VecDeque<u32>, BUFFER_SIZE>,
+        receiver: Receiver<'static, VecDeque<u32>, BUFFER_SIZE>,
     }
 
     #[init(local = [usb_bus: Option<UsbBusAllocator<UsbBus>> = None])]
     fn init(mut c: init::Context) -> (Shared, Local) {
+        {
+            use core::mem::MaybeUninit;
+            const HEAP_SIZE: usize = 4096;
+            static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+            unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
+        }
+
         // Soft-reset does not release the hardware spinlocks
         // Release them now to avoid a deadlock after debug or watchdog reset
         unsafe {
@@ -97,7 +110,8 @@ mod app {
             &mut resets,
             pins.gpio16,
             pins.gpio17,
-            pins.gpio18
+            pins.gpio18,
+            16,
         );
         
         let dma = c.device.DMA.split(&mut resets);
@@ -115,7 +129,7 @@ mod app {
         dma_handler::spawn().ok();
 
         // Channel for USB and DMA communication.
-        let (s, r) = make_channel!(Packet, BUFFER_SIZE);
+        let (s, r) = make_channel!(VecDeque<u32>, BUFFER_SIZE);
 
         (
             Shared { led },
@@ -123,7 +137,6 @@ mod app {
                 tx_transfer: Some(tx_transfer),
                 usb_dev,
                 usbd_audio,
-                usb_audio_buf: [0u8; 1024],
                 sender: s,
                 receiver: r,
             },
@@ -133,10 +146,13 @@ mod app {
     #[task(
         binds = USBCTRL_IRQ,
         priority = 4,
-        local = [usb_dev, usbd_audio, sender, usb_audio_buf],
+        local = [
+            usb_dev, usbd_audio, sender,
+            usb_audio_buf: [u8; 1024] = [0u8; 1024],
+        ],
         shared = [led],
     )]
-    fn usb_handler(mut c: usb_handler::Context) {
+    fn usb_handler(c: usb_handler::Context) {
         if !c.local.usb_dev.poll(&mut [c.local.usbd_audio]) {
             return;
         }
@@ -146,14 +162,12 @@ mod app {
         let sender = c.local.sender;
 
         if let Ok(len) = usbd_audio.read(buf) {
-            unsafe { slice::from_raw_parts(
-                buf.as_ptr().cast::<Packet>(),
-                len / PACKET_SIZE,    // TODO is it good to use division?
-            ) }
-                .into_iter()
-                .for_each( |&packet| {sender.try_send(packet);});
-
-            c.shared.led.lock(|led| led.toggle().ok());
+            let slice = unsafe {
+                slice::from_raw_parts(buf.as_ptr().cast::<u32>(), len/4)
+            };
+            let mut deque = VecDeque::with_capacity(len/4);
+            deque.extend(slice);
+            sender.try_send(deque);
         }
     }
 
@@ -161,14 +175,22 @@ mod app {
     async fn dma_handler(c: dma_handler::Context) {
         let mut tx_transfer = c.local.tx_transfer.take().unwrap();
         let r = c.local.receiver;
+        let mut deque = VecDeque::<u32>::new();
 
         loop {
             let (tx_buf, next_tx_transfer) = async {
                 tx_transfer.wait()
             }.await;
 
-            if let Ok(packet) = r.recv().await {
-                *tx_buf = packet;
+            'l: for word in tx_buf.iter_mut() {
+                while deque.is_empty() {
+                    deque = match r.recv().await {
+                        Ok(d) => d,
+                        Err(_) => break 'l,
+                    }
+                }
+
+                *word = deque.pop_front().unwrap();
             }
 
             tx_transfer = next_tx_transfer.read_next(tx_buf);

@@ -43,7 +43,7 @@ pub fn setup_usb(
 
     let usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x1209, 0x0001))
         .strings(&[StringDescriptors::default()
-            .manufacturer("None")
+            .manufacturer("StinCross Labs")
             .product("RP2040 USB DAC")
             .serial_number("57")])
         .unwrap()
