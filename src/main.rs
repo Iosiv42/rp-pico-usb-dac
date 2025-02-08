@@ -16,12 +16,12 @@ mod app {
     use crate::{setup_clocks::setup_clocks, setup_i2s::setup_i2s, setup_usb::setup_usb};
 
     use super::*;
-    use core::slice;
+    use core::{mem::transmute_copy, slice, task};
 
     use cortex_m::singleton;
     use embedded_hal::digital::StatefulOutputPin;
     use rp_pico::{
-        hal::{self, dma::{double_buffer::{self, Transfer, ReadNext}, Channel, DMAExt, CH0, CH1}, gpio::{bank0::Gpio25, FunctionSio, Pin, PullDown, SioOutput}, usb::UsbBus, watchdog::Watchdog, Sio}, pac::PIO0
+        hal::{self, dma::{double_buffer::{self, ReadNext, Transfer}, Channel, DMAExt, SingleChannel, CH0, CH1}, gpio::{bank0::Gpio25, FunctionSio, Pin, PullDown, SioOutput}, usb::UsbBus, watchdog::Watchdog, Sio}, pac::PIO0
     };
     use hal::pio::{Tx, SM0};
     use rtic_sync::{channel::{Receiver, Sender}, make_channel};
@@ -29,7 +29,7 @@ mod app {
     use usbd_audio::AudioClass;
 
     const PACKET_SIZE: usize = 48;
-    const BUFFER_SIZE: usize = 8;
+    const BUFFER_SIZE: usize = 4;
     type Packet = [u32; PACKET_SIZE];
 
     #[shared]
@@ -48,7 +48,6 @@ mod app {
         >>,
         usb_dev: UsbDevice<'static, UsbBus>,
         usbd_audio: AudioClass<'static, UsbBus>,
-        usb_audio_buf: [u8; 1024],
         sender: Sender<'static, Packet, BUFFER_SIZE>,
         receiver: Receiver<'static, Packet, BUFFER_SIZE>,
     }
@@ -100,7 +99,9 @@ mod app {
             pins.gpio18
         );
         
-        let dma = c.device.DMA.split(&mut resets);
+        let mut dma = c.device.DMA.split(&mut resets);
+        dma.ch0.enable_irq0();
+        dma.ch1.enable_irq0();
         
         // Buffers for DMA tx from mem to SM0.
         let tx_buf0 = singleton!(BUF0: Packet = [0u32; PACKET_SIZE]).unwrap();
@@ -112,8 +113,6 @@ mod app {
         };
         let tx_transfer = tx_transfer.read_next(tx_buf1);
 
-        dma_handler::spawn().ok();
-
         // Channel for USB and DMA communication.
         let (s, r) = make_channel!(Packet, BUFFER_SIZE);
 
@@ -123,7 +122,6 @@ mod app {
                 tx_transfer: Some(tx_transfer),
                 usb_dev,
                 usbd_audio,
-                usb_audio_buf: [0u8; 1024],
                 sender: s,
                 receiver: r,
             },
@@ -132,46 +130,32 @@ mod app {
 
     #[task(
         binds = USBCTRL_IRQ,
-        priority = 4,
-        local = [usb_dev, usbd_audio, sender, usb_audio_buf],
+        priority = 2,
+        local = [
+            usb_dev, usbd_audio, sender,
+            usb_audio_buf: [u8; 1024] = [0u8; 1024],
+        ],
         shared = [led],
     )]
-    fn usb_handler(mut c: usb_handler::Context) {
+    fn usb_handler(c: usb_handler::Context) {
         if !c.local.usb_dev.poll(&mut [c.local.usbd_audio]) {
             return;
         }
 
-        let buf = c.local.usb_audio_buf;
-        let usbd_audio = c.local.usbd_audio;
-        let sender = c.local.sender;
-
-        if let Ok(len) = usbd_audio.read(buf) {
-            unsafe { slice::from_raw_parts(
-                buf.as_ptr().cast::<Packet>(),
-                len / PACKET_SIZE,    // TODO is it good to use division?
-            ) }
-                .into_iter()
-                .for_each( |&packet| {sender.try_send(packet);});
-
-            c.shared.led.lock(|led| led.toggle().ok());
-        }
+        c.local.usbd_audio.read(c.local.usb_audio_buf).ok();
+        let _ = c.local.sender.try_send(unsafe {
+            transmute_copy(c.local.usb_audio_buf)
+        });
     }
 
-    #[task(priority = 3, local = [tx_transfer, receiver], shared = [led])]
-    async fn dma_handler(c: dma_handler::Context) {
-        let mut tx_transfer = c.local.tx_transfer.take().unwrap();
-        let r = c.local.receiver;
+    #[task(binds = DMA_IRQ_0, priority = 1, local = [tx_transfer, receiver])]
+    fn dma_handler(c: dma_handler::Context) {
+        let (tx_buf, next_tx_transfer) = c.local.tx_transfer.take().unwrap().wait();
 
-        loop {
-            let (tx_buf, next_tx_transfer) = async {
-                tx_transfer.wait()
-            }.await;
-
-            if let Ok(packet) = r.recv().await {
-                *tx_buf = packet;
-            }
-
-            tx_transfer = next_tx_transfer.read_next(tx_buf);
+        if let Ok(packet) = c.local.receiver.try_recv() {
+            *tx_buf = packet;
         }
+
+        c.local.tx_transfer.replace(next_tx_transfer.read_next(tx_buf));
     }
 }
