@@ -8,6 +8,8 @@ use rp_pico::{
     pac::{CLOCKS, PLL_SYS, PLL_USB, RESETS, XOSC}
 };
 
+use crate::clock_configs;
+
 /// Setup RP2040 clocks to 132MHz speed.
 pub fn setup_clocks(
     resets: &mut RESETS,
@@ -16,6 +18,8 @@ pub fn setup_clocks(
     clocks_block: CLOCKS,
     dev_pll_sys: PLL_SYS,
     dev_pll_usb: PLL_USB,
+    sample_rate: usize,
+    bit_depth: u32,
 ) -> ClocksManager {
     let xosc = hal::xosc::setup_xosc_blocking(
         xosc_dev,
@@ -28,17 +32,13 @@ pub fn setup_clocks(
 
     let mut clocks = hal::clocks::ClocksManager::new(clocks_block);
 
-    let pll_sys_132_mhz = hal::pll::PLLConfig {
-        vco_freq: 1584.MHz(),
-        refdiv: 1,
-        post_div1: 6,
-        post_div2: 2,
-    };
+    let pll_sys_cfg = clock_configs::from_settings(sample_rate, bit_depth)
+        .unwrap();    // TODO error handling
 
     let pll_sys = hal::pll::setup_pll_blocking(
         dev_pll_sys,
         xosc.operating_frequency().into(),
-        pll_sys_132_mhz,
+        pll_sys_cfg,
         &mut clocks,
         resets
     )

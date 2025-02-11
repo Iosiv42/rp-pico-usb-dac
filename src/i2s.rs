@@ -19,6 +19,8 @@ pub fn setup_i2s<I1, I2, I3, P>(
     bck_gpio: Pin<I1, FunctionNull, P>,
     lrck_gpio: Pin<I2, FunctionNull, P>,
     din_gpio: Pin<I3, FunctionNull, P>,
+    clock_rate: usize,
+    sample_rate: usize,
     bit_depth: u32,
 ) -> (StateMachine<(PIO0, SM0), Running>, Tx<(PIO0, SM0)>)
 where
@@ -56,8 +58,9 @@ where
     let din_pin_id = din_gpio.id().num;
     let _din: Pin<_, FunctionPio0, PullNone> = din_gpio.reconfigure();
 
+    let (int, frac) = clock_divisor(clock_rate, sample_rate, bit_depth);
     let (mut sm, _, mut tx) = PIOBuilder::from_installed_program(installed)
-        .clock_divisor_fixed_point(42, 248)
+        .clock_divisor_fixed_point(int, frac)
         .side_set_pin_base(bck_pin_id)
         .out_pins(din_pin_id, 1)
         .autopull(true)
@@ -104,4 +107,17 @@ pub fn set_bit_depth(
     });
 
     i2s_sm.start()
+}
+
+fn clock_divisor(
+    clock_rate: usize,
+    sample_rate: usize,
+    bit_depth: u32,
+) -> (u16, u8) {
+    let bck_rate = sample_rate * bit_depth as usize * 2 * 2;
+    let ratio = (clock_rate as f32) / (bck_rate as f32);
+    (
+        ratio as u16,
+        (ratio * 256. % 256.) as u8,
+    )
 }
