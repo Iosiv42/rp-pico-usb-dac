@@ -1,22 +1,20 @@
 # RP2040 USB DAC
 
-A 48kHz/16bit (only) USB DAC built upon RP2040 (MCU) and PCM5102 (the DAC itself)
+Multi sample rate (48kHz, 96kHz), multi bit depth (16bit, 24bit) USB DAC built upon RP2040 (MCU) and I2S DAC
 
-## Assembly
+## Assembly Example
 
 ![](assets/assembly.jpg "")
 
 ## Support
-
-Currently tested on Linux with Pipewire (default configs) with no complaints.
+| OS      | Linux (Pipewire) | Windows | MacOS |
+|---------|------------------|---------|-------|
+| Tested? | Yes              | No      | No    |
 
 ## Installation
 
-If you intended to use RPi Pico as MCU, you need only mount and run
+For RPi Pico as RP2040 carrier:
 
 ```shell
-cargo run --release
+$ cargo run --release
 ```
-
-from repository root.
-Otherwise, adjust the program for you board. E.g. change BSP, clock config, pins, etc.
