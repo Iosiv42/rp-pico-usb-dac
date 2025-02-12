@@ -49,7 +49,6 @@ mod app {
 
     const BUFFER_SIZE: usize = 4;
 
-
     #[shared]
     struct Shared {
         led: Pin<Gpio25, FunctionSio<SioOutput>, PullDown>,
@@ -147,7 +146,6 @@ mod app {
             i2s_tx,
         ).start();
         let tx_transfer = tx_transfer.read_next(&mut tx_buf1[..DMA_PACKET_SIZE]);
-
         // Channel for USB and DMA communication.
         let (s, r) = make_channel!(Box<[u8]>, BUFFER_SIZE);
 
