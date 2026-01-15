@@ -17,6 +17,7 @@ extern crate alloc;
 #[rtic::app(device = rp_pico::hal::pac, peripherals = true, dispatchers = [RTC_IRQ, DMA_IRQ_1])]
 mod app {
     use core::slice;
+    use core::fmt::Write;
 
     use crate::{setup_clocks::setup_clocks, i2s::setup_i2s, setup_usb::setup_usb};
 
@@ -24,10 +25,12 @@ mod app {
 
     use alloc::{boxed::Box, collections::linked_list::LinkedList, vec::Vec};
     use cortex_m::singleton;
+    use fugit::RateExtU32;
     use rp_pico::{
-        hal::{self, clocks::ValidSrc, dma::{double_buffer::{self, ReadNext, Transfer}, Channel, DMAExt, SingleChannel, CH0, CH1}, gpio::{bank0::Gpio25, FunctionSio, Pin, PullDown, SioOutput}, pio::{Tx, SM0}, usb::UsbBus, watchdog::Watchdog, Clock, Sio}, pac::PIO0
+        hal::{self, Clock, Sio, clocks::ValidSrc, dma::{CH0, CH1, Channel, DMAExt, SingleChannel, double_buffer::{self, ReadNext, Transfer}, single_buffer}, gpio::{FunctionSio, FunctionUart, Pin, PullDown, SioOutput, bank0::{Gpio4, Gpio5, Gpio25}}, pio::{SM0, Tx}, uart::{self, DataBits, Enabled, StopBits, UartConfig, UartPeripheral}, usb::UsbBus, watchdog::Watchdog}, pac::{PIO0, SYST, UART1}
     };
     use rtic_sync::{channel::{Receiver, Sender}, make_channel};
+    use static_assertions::const_assert;
     use usb_device::{bus::UsbBusAllocator, device::UsbDevice};
     use usbd_audio::AudioClass;
 
@@ -35,33 +38,47 @@ mod app {
     #[global_allocator]
     static HEAP: Heap = Heap::empty();
 
-    const SAMPLE_RATE: usize = 96000;
-    const I2S_BYTE_DEPTH: usize = 2;
+    // =======================================================================
+    // AUDIO CONFIG START
+    // =======================================================================
 
-    const USB_CHANNELS: usize = 2;    // TODO now only 2 works
+
+    const SAMPLE_RATE: usize = 48000;	    // 48k or 96k
+    const USB_CHANNELS: usize = 2;	    // TODO now only 2 works
+    const USB_BYTE_DEPTH: usize = 2;	    // 2/3/4 byte (16/24/32 bit)
+
+
+
+    // =======================================================================
+    // AUDIO CONFIG END
+    // =======================================================================
+
+    const_assert!(SAMPLE_RATE == 48000 || SAMPLE_RATE == 96000);
+    const_assert!(USB_CHANNELS == 2);
+    const_assert!(2 <= USB_BYTE_DEPTH && USB_BYTE_DEPTH <= 4);
+
+    // Since UAC 1.0 has 1ms packets.
     const USB_FRAMES_PER_PACKET: usize = SAMPLE_RATE / 1000;
-    const USB_BYTE_DEPTH: usize = 2;
-    /// In bytes.
+    // In bytes.
     const USB_PACKET_SIZE: usize = USB_FRAMES_PER_PACKET * USB_CHANNELS * USB_BYTE_DEPTH;
 
-    /// In words (u32)
-    const DMA_PACKET_SIZE: usize = USB_FRAMES_PER_PACKET * 2 * I2S_BYTE_DEPTH / 4;
+    // In words (u32)
+    const DMA_TX_BUF_SIZE: usize = USB_FRAMES_PER_PACKET * 2;
 
     const BUFFER_SIZE: usize = 4;
 
     #[shared]
     struct Shared {
         led: Pin<Gpio25, FunctionSio<SioOutput>, PullDown>,
+        uart: UartPeripheral<Enabled, UART1, (Pin<Gpio4, FunctionUart, PullDown>, Pin<Gpio5, FunctionUart, PullDown>)>,
     }
 
     #[local]
     struct Local {
-        tx_transfer: Option<Transfer<
+        tx_transfer: Option<single_buffer::Transfer<
             Channel<CH0>,
-            Channel<CH1>,
             &'static mut [u32],
-            Tx<(PIO0, SM0)>,
-            ReadNext<&'static mut [u32]>
+            Tx<(PIO0, SM0)>
         >>,
         // i2s_tx: Tx<(PIO0, SM0)>,
         usb_dev: UsbDevice<'static, UsbBus>,
@@ -97,7 +114,7 @@ mod app {
             c.device.PLL_SYS,
             c.device.PLL_USB,
             SAMPLE_RATE,
-            (I2S_BYTE_DEPTH * 8) as u32,
+            (USB_BYTE_DEPTH * 8) as u32,
         );
 
         let sio = Sio::new(c.device.SIO);
@@ -107,6 +124,22 @@ mod app {
             sio.gpio_bank0,
             &mut resets,
         );
+
+
+        // ===================================================================
+        // PIN CONFIG START
+        // ===================================================================
+
+
+        let DIN_GPIO = pins.gpio18;	// aka SDIN, SD, SDATA, DACDAT
+        let LRCK_GPIO = pins.gpio17;	// aka LCK, WS
+        let BCLK_GPIO = pins.gpio16;	// aka BCK, SCK
+
+
+        // ===================================================================
+        // PIN CONFIG END
+        // ===================================================================
+
 
         let led = pins.led.into_push_pull_output_in_state(hal::gpio::PinState::Low);
 
@@ -124,33 +157,49 @@ mod app {
         let (_i2s_sm, i2s_tx) = setup_i2s(
             c.device.PIO0,
             &mut resets,
-            pins.gpio16,
-            pins.gpio17,
-            pins.gpio18,
+            BCLK_GPIO,
+            LRCK_GPIO,
+            DIN_GPIO,
             clocks.system_clock.freq().to_Hz() as usize,
             SAMPLE_RATE,
-            (I2S_BYTE_DEPTH * 8) as u32,
+            (USB_BYTE_DEPTH * 8) as u32,
         );
         
         let mut dma = c.device.DMA.split(&mut resets);
         dma.ch0.enable_irq0();
-        dma.ch1.enable_irq0();
         
         // Buffers for DMA tx from mem to SM0.
-        let tx_buf0 = singleton!(BUF0: [u32; 256] = [0u32; 256]).unwrap();
-        let tx_buf1 = singleton!(BUF1: [u32; 256] = [0u32; 256]).unwrap();
+        let tx_buf0 = singleton!(BUF0: [u32; DMA_TX_BUF_SIZE] = [0; DMA_TX_BUF_SIZE]).unwrap();
 
-        let tx_transfer = double_buffer::Config::new(
-            (dma.ch0, dma.ch1),
-            &mut tx_buf0[..DMA_PACKET_SIZE],
+        let tx_transfer = single_buffer::Config::new(
+            dma.ch0,
+            tx_buf0.as_mut_slice(),
             i2s_tx,
         ).start();
-        let tx_transfer = tx_transfer.read_next(&mut tx_buf1[..DMA_PACKET_SIZE]);
+
         // Channel for USB and DMA communication.
         let (s, r) = make_channel!(Box<[u8]>, BUFFER_SIZE);
 
+        let uart_pins = (
+            // UART TX (characters sent from RP2040) on pin 1 (GPIO0)
+            pins.gpio4.into_function(),
+            // UART RX (characters received by RP2040) on pin 2 (GPIO1)
+            pins.gpio5.into_function(),
+        );
+        let uart = UartPeripheral::new(c.device.UART1, uart_pins, &mut resets)
+            .enable(
+                UartConfig::new(115200_u32.Hz(), DataBits::Eight, None, StopBits::One),
+                clocks.peripheral_clock.freq(),
+            )
+            .unwrap();
+
+        uart.write_full_blocking(b"UART debug mode\r\n");
+
         (
-            Shared { led },
+            Shared {
+                led ,
+                uart,
+            },
             Local {
                 tx_transfer: Some(tx_transfer),
                 usb_dev,
@@ -165,13 +214,14 @@ mod app {
         binds = USBCTRL_IRQ,
         priority = 2,
         local = [usb_dev, usbd_audio, sender],
-        shared = [led],
+        shared = [led, uart],
     )]
-    fn usb_handler(c: usb_handler::Context) {
+    fn usb_handler(mut c: usb_handler::Context) {
         if !c.local.usb_dev.poll(&mut [c.local.usbd_audio]) {
             return;
         }
 
+        // Send samples to I2S channel
         let mut buf = Vec::with_capacity(USB_PACKET_SIZE);
         unsafe { buf.set_len(USB_PACKET_SIZE) };
         if let Ok(_) = c.local.usbd_audio.read(buf.as_mut_slice()) {
@@ -179,26 +229,31 @@ mod app {
         }
     }
 
-    #[task(binds = DMA_IRQ_0, priority = 1, local = [tx_transfer, receiver])]
-    fn dma_handler(c: dma_handler::Context) {
-        let (tx_buf, next_tx_transfer) = c.local.tx_transfer.take().unwrap().wait();
+    #[task(
+        binds = DMA_IRQ_0,
+        priority = 1,
+        local = [tx_transfer, receiver],
+        shared = [uart],
+    )]
+    fn dma_handler(mut c: dma_handler::Context) {
+        let (ch, tx_buf, i2s_tx) = c.local.tx_transfer.take().unwrap().wait();
 
+        // Try receive USB samples
         if let Ok(packet) = c.local.receiver.try_recv() {
-            let da = unsafe { slice::from_raw_parts_mut(
-                tx_buf.as_mut_ptr().cast::<u8>(),
-                DMA_PACKET_SIZE * 4,
-            ) };
-            let trailing_bytes_count = I2S_BYTE_DEPTH - USB_BYTE_DEPTH;
-            let mut i = trailing_bytes_count;
-            for &byte in packet.iter() {
-                da[i] = byte;
-                i += 1;
-                if i % I2S_BYTE_DEPTH == 0 {
-                    i += trailing_bytes_count;
-                }
+            // Fit samples from USB to words (I2S PIO expects that)
+            let mut chunks = packet.chunks_exact(USB_BYTE_DEPTH);
+            let mut bytes = [0_u8; 4];
+            for word in tx_buf.iter_mut() {
+                let chunk = chunks.next().unwrap();
+                bytes[(4 - USB_BYTE_DEPTH)..].copy_from_slice(chunk);
+                *word = u32::from_le_bytes(bytes);
             }
         }
 
-        c.local.tx_transfer.replace(next_tx_transfer.read_next(&mut tx_buf[..DMA_PACKET_SIZE]));
+        c.local.tx_transfer.replace(single_buffer::Config::new(
+            ch,
+            tx_buf,
+            i2s_tx,
+        ).start());
     }
 }

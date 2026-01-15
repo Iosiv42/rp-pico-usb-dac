@@ -16,7 +16,7 @@ use rp_pico::{
 pub fn setup_i2s<I1, I2, I3, P>(
     pio0: PIO0,
     resets: &mut RESETS,
-    bck_gpio: Pin<I1, FunctionNull, P>,
+    bclk_gpio: Pin<I1, FunctionNull, P>,
     lrck_gpio: Pin<I2, FunctionNull, P>,
     din_gpio: Pin<I3, FunctionNull, P>,
     clock_rate: usize,
@@ -31,26 +31,42 @@ where
 {
     let (mut pio0, sm0, _, _, _) = pio0.split(resets);
 
+    // Thanks malacalypse for PIO program which I find in his
+    // rp2040_i2s_example GitHub repository.
     let program_with_defines = pio_proc::pio_asm!(
+        "; This block also outputs the word clock (also called frame or LR clock) and",
+        "; the bit clock.",
+        ";",
+        "; Set register x to (bit depth - 2) (e.g. for 24 bit audio, set to 22).",
+        "; Note that if this is needed to be synchronous with the SCK module,",
+        "; it is not possible to run 24-bit frames with an SCK of 256x fs. You must either",
+        "; run SCK at 384x fs (if your codec permits this) or use 32-bit frames, which",
+        "; work fine with 24-bit codecs.",
+        "",
         ".side_set 2",
-        ".wrap_target",
-        "mov x, y side 0b01",
-        "left:",
-            "out pins, 1 side 0b00",
-            "jmp x--, left side 0b01",
-        "out pins, 1 side 0b10",
-        "mov x, y side 0b11",
-        "right:",
-            "out pins, 1 side 0b10",
-            "jmp x--, right side 0b11",
-        "out pins, 1 side 0b00",
-        ".wrap",
+        "",
+        "public entry_point:",
+        ";                        /--- LRCLK",
+        ";                        |/-- BCLK",
+        "frameL:                ; ||",
+        "mov x, y          side 0b00 ; start of Left frame",
+        "pull noblock      side 0b01 ; One clock after edge change with no data",
+        "dataL:",
+        "out pins, 1       side 0b00",
+        "jmp x-- dataL     side 0b01",
+        "",
+        "frameR:",
+        "mov x, y          side 0b10",
+        "pull noblock      side 0b11 ; One clock after edge change with no data",
+        "dataR:",
+        "out pins, 1       side 0b10",
+        "jmp x-- dataR     side 0b11",
     );
     let program = program_with_defines.program;
     let installed = pio0.install(&program).unwrap();
 
-    let bck_pin_id = bck_gpio.id().num;
-    let _bck: Pin<_, FunctionPio0, PullNone> = bck_gpio.reconfigure();
+    let bck_pin_id = bclk_gpio.id().num;
+    let _bck: Pin<_, FunctionPio0, PullNone> = bclk_gpio.reconfigure();
 
     let lrck_pin_id = lrck_gpio.id().num;
     let _lrck: Pin<_, FunctionPio0, PullNone> = lrck_gpio.reconfigure();
@@ -63,7 +79,7 @@ where
         .clock_divisor_fixed_point(int, frac)
         .side_set_pin_base(bck_pin_id)
         .out_pins(din_pin_id, 1)
-        .autopull(true)
+        .autopull(false)
         .out_shift_direction(hal::pio::ShiftDirection::Left)
         .build(sm0);
 
@@ -76,9 +92,7 @@ where
     (set_bit_depth(sm.start(), &mut tx, bit_depth), tx)
 }
 
-/// Sets the bit depth of audio stream. Note that PCM must be tightly packed
-/// without any padding. I.e. it's not allowed for 24 bit depth to be
-/// [123, 12, 55, 0]. It must be [123, 12, 55].
+/// Sets the bit depth of an audio stream. For future.
 pub fn set_bit_depth(
     i2s_sm: StateMachine<(PIO0, SM0), Running>,
     i2s_tx: &mut Tx<(PIO0, SM0)>,
@@ -87,7 +101,7 @@ pub fn set_bit_depth(
     while !i2s_tx.is_empty() {}
 
     let mut i2s_sm = i2s_sm.stop();
-    i2s_tx.write(bit_depth - 2);
+    i2s_tx.write(bit_depth - 2);    // As stated in PIO commentary
 
     i2s_sm.exec_instruction(Instruction {
         operands: InstructionOperands::PULL {

@@ -21,6 +21,7 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 panic-probe = "0.3.2"
 usbd-audio = "0.2.0"
 embedded-alloc = "0.6.0"
+static_assertions = "1.1.0"
 
 [profile.dev]
 opt-level = 1
